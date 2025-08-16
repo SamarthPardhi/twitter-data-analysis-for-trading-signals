@@ -1,119 +1,98 @@
-"""
-analyze.py: Analyzes processed tweets and generates trading signals.
-
-This script is updated to:
-- Load data from the Parquet file created by process.py.
-- Generate sentiment scores from the cleaned text.
-- Create a composite signal, acknowledging that engagement data may be synthetic.
-- Aggregate signals over time, noting timestamps may reflect scrape time, not post time.
-- Create memory-efficient visualizations.
-"""
+# analyze.py
 import pandas as pd
-import numpy as np
-from textblob import TextBlob
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.preprocessing import MinMaxScaler
 import matplotlib.pyplot as plt
-import logging
-from pathlib import Path
+import numpy as np
 
-# --- Configuration ---
-PROCESSED_DATA_FILE = Path('processed_tweets.parquet')
-PLOT_OUTPUT_FILE = Path('market_signal_plot.png')
-AGGREGATION_WINDOW = '15T' # Aggregate signals into 15-minute windows
+def analyze_data(input_parquet_path='processed_tweets.parquet'):
+    """
+    Loads processed data and performs analysis to generate trading signals.
+    """
+    print("Loading processed data for analysis...")
+    df = pd.read_parquet(input_parquet_path)
 
-# --- Setup Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-def generate_sentiment_signal(df: pd.DataFrame) -> pd.DataFrame:
-    """Generates a sentiment polarity score (-1 to 1) for each tweet."""
-    logging.info("Generating sentiment signals...")
-    # TextBlob is robust enough for this task. For production, a fine-tuned model would be better.
-    df['sentiment'] = df['cleaned_content'].apply(lambda x: TextBlob(x).sentiment.polarity)
-    return df
-
-def aggregate_signals(df: pd.DataFrame, window: str) -> pd.DataFrame:
-    """Aggregates signals into time-based windows with confidence intervals."""
-    logging.info(f"Aggregating signals into {window} windows...")
-    if df.empty or 'timestamp_utc' not in df.columns:
-        logging.warning("DataFrame is empty or missing timestamp. Skipping aggregation.")
-        return pd.DataFrame()
-        
+    # Ensure data is sorted by time for time-series analysis
+    df.sort_values('timestamp_utc', inplace=True)
     df.set_index('timestamp_utc', inplace=True)
-    
-    # Create a composite signal. Sentiment is weighted higher as it's more reliable than
-    # the potentially random engagement data from the scraper.
-    df['engagement'] = np.log1p(df['likes'] + df['retweets'] * 1.5 + df['replies'])
-    # Normalize engagement to be roughly in the same scale as sentiment [-1, 1]
-    df['engagement_normalized'] = (df['engagement'] - df['engagement'].mean()) / df['engagement'].std()
-    
-    df['composite_signal'] = (df['sentiment'] * 0.7) + (df['engagement_normalized'] * 0.3)
 
-    # Resample and aggregate to get statistics for each time window
-    aggregated = df['composite_signal'].resample(window).agg(['mean', 'std', 'count'])
-    aggregated['std'].fillna(0, inplace=True)
-    
-    # Calculate 95% Confidence Interval for the mean signal
-    z_score = 1.96
-    aggregated['ci_lower'] = aggregated['mean'] - z_score * (aggregated['std'] / np.sqrt(aggregated['count']))
-    aggregated['ci_upper'] = aggregated['mean'] + z_score * (aggregated['std'] / np.sqrt(aggregated['count']))
-    
-    return aggregated.dropna()
+    print("Data loaded. Starting analysis...")
 
-def plot_aggregated_signals(aggregated_df: pd.DataFrame):
-    """Creates and saves a memory-efficient plot of the aggregated signals."""
-    if aggregated_df.empty:
-        logging.warning("No data to plot.")
-        return
-        
-    logging.info("Generating and saving signal plot...")
+    # --- 1. Text-to-Signal Conversion (TF-IDF) ---
+    print("\n--- Generating TF-IDF based Buzz Signal ---")
+    # Use a small number of features for a simple "buzz" score
+    vectorizer = TfidfVectorizer(max_features=100, stop_words='english')
+    tfidf_matrix = vectorizer.fit_transform(df['cleaned_content'].dropna())
+
+    # Create a simple "buzz" signal by summing the TF-IDF scores for each tweet
+    # This represents the overall importance of the terms in that tweet.
+    df['buzz_signal'] = np.asarray(tfidf_matrix.sum(axis=1)).ravel()
+    print("Top 10 words by TF-IDF:", vectorizer.get_feature_names_out()[:10])
+
+
+    # --- 2. Signal Aggregation ---
+    print("\n--- Creating a Composite Trading Signal ---")
+    # Combine multiple features into a single signal
+    # We will use buzz_signal, retweet_count, and like_count
+    
+    # Normalize the features to be on a similar scale (0 to 1)
+    scaler = MinMaxScaler()
+    df[['buzz_normalized', 'retweets_normalized', 'likes_normalized']] = scaler.fit_transform(
+        df[['buzz_signal', 'retweet_count', 'like_count']]
+    )
+
+    # Define weights for each component
+    # Let's say content buzz is most important
+    weights = {'buzz': 0.6, 'retweets': 0.3, 'likes': 0.1}
+
+    # Calculate the composite signal
+    df['composite_signal'] = (
+        weights['buzz'] * df['buzz_normalized'] +
+        weights['retweets'] * df['retweets_normalized'] +
+        weights['likes'] * df['likes_normalized']
+    )
+    
+    # Calculate a confidence interval (e.g., based on user followers)
+    # Here, we create a simple confidence score: more followers = higher confidence
+    df['confidence'] = scaler.fit_transform(df[['user_followers']])
+    
+    print("Sample of generated signals:")
+    print(df[['composite_signal', 'confidence']].head())
+
+
+    # --- 3. Memory-Efficient Visualization ---
+    print("\n--- Generating Visualizations ---")
+    # To visualize large datasets, we resample the data instead of plotting every point.
+    # Let's resample the signals to a 15-minute interval.
+    
+    resampled_df = df['composite_signal'].resample('15T').mean().dropna()
+    resampled_confidence = df['confidence'].resample('15T').mean().dropna()
+
     plt.style.use('seaborn-v0_8-darkgrid')
-    fig, ax = plt.subplots(figsize=(15, 7))
-    
-    aggregated_df['mean'].plot(ax=ax, label='Aggregated Market Signal (Mean)', color='royalblue', lw=2)
-    ax.fill_between(aggregated_df.index,
-                    aggregated_df['ci_lower'],
-                    aggregated_df['ci_upper'],
-                    color='skyblue', alpha=0.4, label='95% Confidence Interval')
-    
-    ax.set_title('Aggregated Market Sentiment Signal Over Time', fontsize=16)
-    ax.set_xlabel('Timestamp (UTC)', fontsize=12)
-    ax.set_ylabel('Composite Signal Value', fontsize=12)
-    ax.legend()
-    ax.grid(True, which='both', linestyle='--', linewidth=0.5)
-    
-    plt.tight_layout()
-    plt.savefig(PLOT_OUTPUT_FILE)
-    logging.info(f"Signal plot saved to {PLOT_OUTPUT_FILE}")
+    fig, ax1 = plt.subplots(figsize=(15, 7))
 
-def main():
-    """Main analysis pipeline."""
-    logging.info("Starting data analysis script...")
+    # Plot the aggregated signal
+    ax1.plot(resampled_df.index, resampled_df.values, label='Aggregated Composite Signal (15min avg)', color='b')
+    ax1.set_xlabel('Time (UTC)')
+    ax1.set_ylabel('Composite Signal Strength', color='b')
+    ax1.tick_params(axis='y', labelcolor='b')
+    ax1.set_title('Aggregated Market Buzz Signal Over Time')
     
-    # --- IMPORTANT CAVEAT ---
-    logging.warning("Analysis is based on data from scrapper.py, which may contain RANDOMIZED engagement and timestamp data if real-time parsing fails. Interpret results with caution.")
-    
-    if not PROCESSED_DATA_FILE.is_file():
-        logging.error(f"Processed data file not found at {PROCESSED_DATA_FILE}. Please run process.py first.")
-        return
-        
-    df = pd.read_parquet(PROCESSED_DATA_FILE)
-    
-    # 1. Generate sentiment signals
-    df = generate_sentiment_signal(df)
+    # Create a second y-axis for confidence
+    ax2 = ax1.twinx()
+    ax2.plot(resampled_confidence.index, resampled_confidence.values, label='Avg. Confidence (15min avg)', color='g', linestyle='--')
+    ax2.set_ylabel('Average Confidence Score', color='g')
+    ax2.tick_params(axis='y', labelcolor='g')
 
-    # 2. Aggregate signals into a time-series
-    agg_signals = aggregate_signals(df, window=AGGREGATION_WINDOW)
+    fig.tight_layout()
+    plt.legend()
     
-    if not agg_signals.empty:
-        logging.info("\n--- Sample of Aggregated Signals ---")
-        print(agg_signals.head().to_string())
-        logging.info("------------------------------------\n")
-    
-        # 3. Memory-efficient visualization
-        plot_aggregated_signals(agg_signals)
-    else:
-        logging.warning("No signals were generated after aggregation.")
+    # Save the plot to a file
+    plot_filename = 'market_signal_visualization.png'
+    plt.savefig(plot_filename)
+    print(f"Visualization saved to {plot_filename}")
+    plt.show()
 
-if __name__ == "__main__":
-    # Ensure TextBlob corpora are downloaded (only needs to be done once)
-    # import nltk; nltk.download('punkt'); nltk.download('brown')
-    main()
+
+if __name__ == '__main__':
+    analyze_data()
