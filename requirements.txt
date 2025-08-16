@@ -1,6 +1,6 @@
+snscrape
 pandas
-requests
-beautifulsoup4
-textblob
-matplotlib
 pyarrow
+scikit-learn
+matplotlib
+seaborn
